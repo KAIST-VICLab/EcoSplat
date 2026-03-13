@@ -1,0 +1,4 @@
+chamfer_distance:
+  weight: 0.1
+  down_sample_ratio: 0.1
+  sigma_image: null
