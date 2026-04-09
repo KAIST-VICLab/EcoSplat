@@ -18,6 +18,7 @@
     *Co-first authors (equal contribution), †Co-corresponding authors
   </p>
   <h3 align="center">CVPR 2026</h3>
+  <h3 align="center">Highlight</h3>
   <h3 align="center"><a href="https://arxiv.org/abs/2512.18692">Paper</a> | <a href="https://kaist-viclab.github.io/ecosplat-site/">Project Page</a> | <a href="https://github.com/KAIST-VICLab/EcoSplat">Code</a> </h3>
   <div align="center"></div>
 </p>
