@@ -750,11 +750,11 @@ class EncoderEcoSplat(Encoder[EncoderEcoSplatCfg]):
         poses = rearrange(poses, "(b v) ... -> b v ...", b=b, v=v)
 
         if self.cfg.pose_make_baseline_1:
-            a = poses[:, 0, :3, 3]  # [b, 3]
-            b = poses[:, 1, :3, 3]  #  [b, 3]
+            a = poses[:, context_index.argmin().item(), :3, 3]  # [b, 3]
+            b = poses[:, context_index.argmax().item(), :3, 3]  #  [b, 3]
 
             scale = (a - b).norm(dim=1, keepdim=True)  # [b, 1]
-
+            # scale = (a - poses[:, 1, :3, 3]).norm(dim=1, keepdim=True)
             poses[:, :, :3, 3] /= scale.unsqueeze(-1)
 
         if self.cfg.pose_make_relative:
