@@ -560,11 +560,11 @@ class EncoderEcoSplat(Encoder[EncoderEcoSplatCfg]):
         
         if self.cfg.estimating_pose:
             poses_enc = torch.cat(all_pose_params, dim=1) # (b, v, 9)
-            pred_extrinsics = self.process_pose(poses_enc, v_cxt) # (b, v, 4, 4)
+            pred_extrinsics = self.process_pose(poses_enc,  context['index']) # (b, v, 4, 4)
 
             if target is not None:
                 poses_enc_cwt = torch.cat(all_pose_params_cwt, dim=1) # (b, v + v2, 9)
-                pred_extrinsics_cwt = self.process_pose(poses_enc_cwt, v_cxt) # (b, v + v2, 4, 4)
+                pred_extrinsics_cwt = self.process_pose(poses_enc_cwt,  context['index']) # (b, v + v2, 4, 4)
 
         pts_all = torch.cat(all_mean_res, dim=1) # [b, v, h, w, 3]
         pts_all = rearrange(pts_all, "b v h w xyz -> b v (h w) xyz")
@@ -743,7 +743,7 @@ class EncoderEcoSplat(Encoder[EncoderEcoSplatCfg]):
         encoder_output['compression_ratio'] = primitive_ratio
         return encoder_output
 
-    def process_pose(self, pose_enc, context_views):
+    def process_pose(self, pose_enc, context_index):
         # pose_enc: (b v 9)
         b, v = pose_enc.shape[:2]
         poses = convert_pose_to_4x4(rearrange(pose_enc, "b v ... -> (b v) ..."))
