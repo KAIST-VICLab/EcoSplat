@@ -113,9 +113,9 @@ Please also consider citing the SPFSplat base:
 
 ```bibtex
 @article{huang2025spfsplat,
-  title={No Pose at All: Self-Supervised Pose-Free 3D Gaussian Splatting from Sparse Views},
-  author={Huang, Ranran and Mikolajczyk, Krystian},
-  journal={arXiv preprint arXiv:2508.01171},
-  year={2025}
-}
+      title={No Pose at All: Self-Supervised Pose-Free 3D Gaussian Splatting from Sparse Views},
+      author={Huang, Ranran and Mikolajczyk, Krystian},
+      journal={arXiv preprint arXiv: 2508.01171},
+      year={2025}
+    }
 ```
