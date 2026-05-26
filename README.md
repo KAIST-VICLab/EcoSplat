@@ -118,12 +118,12 @@ This project applies EcoSplat to [ZPressor](https://github.com/ziplab/ZPressor),
 If you find EcoSplat useful, please cite:
 
 ```bibtex
-@article{park2025ecosplat,
-  title={EcoSplat: Efficiency-controllable Feed-forward 3D Gaussian Splatting from Multi-view Images},
-  author={Park, Jongmin and Bui, Minh-Quan Viet and Bello, Juan Luis Gonzalez and Moon, Jaeho and Oh, Jihyong and Kim, Munchurl},
-  journal={arXiv preprint arXiv:2512.18692},
-  year={2025}
-}
+@inproceedings{park2025ecosplat,
+      title={EcoSplat: Efficiency-controllable Feed-forward 3D Gaussian Splatting from Multi-view Images}, 
+      author={Jongmin Park and Minh-Quan Viet Bui and Juan Luis Gonzalez Bello and Jaeho Moon and Jihyong Oh and Munchurl Kim},
+        year = {2026},
+      booktitle={CVPR},
+      }
 ```
 
 Please also consider citing the ZPressor base:
