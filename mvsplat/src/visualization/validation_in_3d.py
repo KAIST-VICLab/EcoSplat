@@ -77,8 +77,6 @@ def render_projections(
             gaussians.covariances,
             gaussians.harmonics,
             gaussians.opacities,
-            gaussians.rotations,
-            gaussians.scales,
             fov_degrees=10.0,
         )
         if draw_label:
