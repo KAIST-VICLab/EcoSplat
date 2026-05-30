@@ -2,8 +2,11 @@ from math import isqrt
 from typing import Literal
 
 import torch
+from diff_gaussian_rasterization import (
+    GaussianRasterizationSettings,
+    GaussianRasterizer,
+)
 from einops import einsum, rearrange, repeat
-from gsplat import rasterization
 from jaxtyping import Float
 from torch import Tensor
 
@@ -49,31 +52,21 @@ def render_cuda(
     image_shape: tuple[int, int],
     background_color: Float[Tensor, "batch 3"],
     gaussian_means: Float[Tensor, "batch gaussian 3"],
-    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],  # unused, kept for sig stability
+    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
     gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
-    gaussian_rotations: Float[Tensor, "batch gaussian 4"],
-    gaussian_scales: Float[Tensor, "batch gaussian 3"],
     scale_invariant: bool = True,
     use_sh: bool = True,
-) -> tuple[
-    Float[Tensor, "batch 3 height width"],
-    Float[Tensor, "batch height width"],
-    Float[Tensor, "batch height width"],
-]:
-    """gsplat rasterization. Returns (color, depth, alpha).
-
-    Mirrors the spfsplat_stage2 call signature: passes world-space (quats,
-    scales) directly to gsplat. `gaussian_covariances` is ignored.
-    """
+) -> Float[Tensor, "batch 3 height width"]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
+    # Make sure everything is in a range where numerical issues don't appear.
     if scale_invariant:
         scale = 1 / near
         extrinsics = extrinsics.clone()
         extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
+        gaussian_covariances = gaussian_covariances * (scale[:, None, None, None] ** 2)
         gaussian_means = gaussian_means * scale[:, None, None]
-        gaussian_scales = gaussian_scales * scale[:, None, None]
         near = near * scale
         far = far * scale
 
@@ -81,53 +74,57 @@ def render_cuda(
     degree = isqrt(n) - 1
     shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
 
-    b, _, _ = gaussian_means.shape
+    b, _, _ = extrinsics.shape
     h, w = image_shape
 
-    view_matrix = extrinsics.inverse()
-    test_intr = intrinsics.clone()
-    test_intr[:, 0] = intrinsics[:, 0] * w
-    test_intr[:, 1] = intrinsics[:, 1] * h
+    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
+    tan_fov_x = (0.5 * fov_x).tan()
+    tan_fov_y = (0.5 * fov_y).tan()
 
-    # mvsplat stores quaternions as (x, y, z, w); gsplat expects (w, x, y, z).
-    gaussian_rotations_wxyz = gaussian_rotations[..., [3, 0, 1, 2]]
+    projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
+    projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
+    view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
+    full_projection = view_matrix @ projection_matrix
 
     all_images = []
-    all_depths = []
-    all_alphas = []
+    all_radii = []
     for i in range(b):
-        # gsplat `colors` layout:
-        #   SH path (sh_degree set):   (N, K, 3) per-Gaussian SH coefficients.
-        #   Precomp path (sh_degree=None): (N, channels) per-Gaussian RGB.
-        if use_sh:
-            colors_i = shs[i]
-        else:
-            colors_i = shs[i, :, 0, :]  # (N, 3)
-        image, rendered_alpha, _ = rasterization(
-            gaussian_means[i],
-            gaussian_rotations_wxyz[i],
-            gaussian_scales[i],
-            gaussian_opacities[i],
-            colors_i,
-            view_matrix[i][None],
-            test_intr[i][None],
-            w,
-            h,
-            sh_degree=degree if use_sh else None,
-            render_mode="RGB+D",
-            packed=False,
-            near_plane=1e-10,
-            backgrounds=background_color[i].unsqueeze(0),
-            radius_clip=0.0,  # match mvsplat baseline (diff_gaussian_rasterization has no radius cull)
-            rasterize_mode="classic",
+        # Set up a tensor for the gradients of the screen-space means.
+        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
+        try:
+            mean_gradients.retain_grad()
+        except Exception:
+            pass
+
+        settings = GaussianRasterizationSettings(
+            image_height=h,
+            image_width=w,
+            tanfovx=tan_fov_x[i].item(),
+            tanfovy=tan_fov_y[i].item(),
+            bg=background_color[i],
+            scale_modifier=1.0,
+            viewmatrix=view_matrix[i],
+            projmatrix=full_projection[i],
+            sh_degree=degree,
+            campos=extrinsics[i, :3, 3],
+            prefiltered=False,  # This matches the original usage.
+            debug=False,
         )
-        image_with_depth = image.squeeze(0).permute(2, 0, 1)
-        image, rendered_depth = torch.split(image_with_depth, [3, 1], dim=0)
-        rendered_alpha = rendered_alpha.squeeze(0).permute(2, 0, 1)
+        rasterizer = GaussianRasterizer(settings)
+
+        row, col = torch.triu_indices(3, 3)
+
+        image, radii = rasterizer(
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            cov3D_precomp=gaussian_covariances[i, :, row, col],
+        )
         all_images.append(image)
-        all_depths.append(rendered_depth.squeeze(0))
-        all_alphas.append(rendered_alpha.squeeze(0))
-    return torch.stack(all_images), torch.stack(all_depths), torch.stack(all_alphas)
+        all_radii.append(radii)
+    return torch.stack(all_images)
 
 
 def render_cuda_orthographic(
@@ -139,16 +136,13 @@ def render_cuda_orthographic(
     image_shape: tuple[int, int],
     background_color: Float[Tensor, "batch 3"],
     gaussian_means: Float[Tensor, "batch gaussian 3"],
-    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],  # unused; kept for sig stability
+    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
     gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
-    gaussian_rotations: Float[Tensor, "batch gaussian 4"],
-    gaussian_scales: Float[Tensor, "batch gaussian 3"],
     fov_degrees: float = 0.1,
     use_sh: bool = True,
     dump: dict | None = None,
 ) -> Float[Tensor, "batch 3 height width"]:
-    """gsplat orthographic rasterization (camera_model='ortho')."""
     b, _, _ = extrinsics.shape
     h, w = image_shape
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
@@ -157,49 +151,72 @@ def render_cuda_orthographic(
     degree = isqrt(n) - 1
     shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
 
+    # Create fake "orthographic" projection by moving the camera back and picking a
+    # small field of view.
+    fov_x = torch.tensor(fov_degrees, device=extrinsics.device).deg2rad()
+    tan_fov_x = (0.5 * fov_x).tan()
+    distance_to_near = (0.5 * width) / tan_fov_x
+    tan_fov_y = 0.5 * height / distance_to_near
+    fov_y = (2 * tan_fov_y).atan()
+    near = near + distance_to_near
+    far = far + distance_to_near
+    move_back = torch.eye(4, dtype=torch.float32, device=extrinsics.device)
+    move_back[2, 3] = -distance_to_near
+    extrinsics = extrinsics @ move_back
+
+    # Escape hatch for visualization/figures.
     if dump is not None:
         dump["extrinsics"] = extrinsics
-        dump["width"] = width
-        dump["height"] = height
+        dump["fov_x"] = fov_x
+        dump["fov_y"] = fov_y
         dump["near"] = near
         dump["far"] = far
 
-    view_matrix = extrinsics.inverse()
-
-    # Build ortho K per batch: maps world units -> pixel coords.
-    Ks = torch.zeros((b, 3, 3), dtype=extrinsics.dtype, device=extrinsics.device)
-    Ks[:, 0, 0] = w / width
-    Ks[:, 1, 1] = h / height
-    Ks[:, 0, 2] = w * 0.5
-    Ks[:, 1, 2] = h * 0.5
-    Ks[:, 2, 2] = 1.0
-
-    # mvsplat stores quaternions as (x, y, z, w); gsplat expects (w, x, y, z).
-    gaussian_rotations_wxyz = gaussian_rotations[..., [3, 0, 1, 2]]
+    projection_matrix = get_projection_matrix(
+        near, far, repeat(fov_x, "-> b", b=b), fov_y
+    )
+    projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
+    view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
+    full_projection = view_matrix @ projection_matrix
 
     all_images = []
+    all_radii = []
     for i in range(b):
-        colors_i = shs[i] if use_sh else shs[i, :, 0, :]
-        image, _alpha, _ = rasterization(
-            gaussian_means[i],
-            gaussian_rotations_wxyz[i],
-            gaussian_scales[i],
-            gaussian_opacities[i],
-            colors_i,
-            view_matrix[i][None],
-            Ks[i][None],
-            w,
-            h,
-            sh_degree=degree if use_sh else None,
-            render_mode="RGB",
-            packed=False,
-            near_plane=float(near[i].item()) if near[i].numel() == 1 else 1e-10,
-            far_plane=float(far[i].item()) if far[i].numel() == 1 else 1e10,
-            backgrounds=background_color[i].unsqueeze(0),
-            rasterize_mode="classic",
-            camera_model="ortho",
+        # Set up a tensor for the gradients of the screen-space means.
+        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
+        try:
+            mean_gradients.retain_grad()
+        except Exception:
+            pass
+
+        settings = GaussianRasterizationSettings(
+            image_height=h,
+            image_width=w,
+            tanfovx=tan_fov_x,
+            tanfovy=tan_fov_y,
+            bg=background_color[i],
+            scale_modifier=1.0,
+            viewmatrix=view_matrix[i],
+            projmatrix=full_projection[i],
+            sh_degree=degree,
+            campos=extrinsics[i, :3, 3],
+            prefiltered=False,  # This matches the original usage.
+            debug=False,
         )
-        all_images.append(image.squeeze(0).permute(2, 0, 1))
+        rasterizer = GaussianRasterizer(settings)
+
+        row, col = torch.triu_indices(3, 3)
+
+        image, radii = rasterizer(
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            cov3D_precomp=gaussian_covariances[i, :, row, col],
+        )
+        all_images.append(image)
+        all_radii.append(radii)
     return torch.stack(all_images)
 
 
@@ -215,8 +232,6 @@ def render_depth_cuda(
     gaussian_means: Float[Tensor, "batch gaussian 3"],
     gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
     gaussian_opacities: Float[Tensor, "batch gaussian"],
-    gaussian_rotations: Float[Tensor, "batch gaussian 4"],
-    gaussian_scales: Float[Tensor, "batch gaussian 3"],
     scale_invariant: bool = True,
     mode: DepthRenderingMode = "depth",
 ) -> Float[Tensor, "batch height width"]:
@@ -235,9 +250,9 @@ def render_depth_cuda(
     elif mode == "log":
         fake_color = fake_color.minimum(near[:, None]).maximum(far[:, None]).log()
 
-    # Render using depth-as-color; read it back from the color channel.
+    # Render using depth as color.
     b, _ = fake_color.shape
-    color, _depth, _alpha = render_cuda(
+    result = render_cuda(
         extrinsics,
         intrinsics,
         near,
@@ -248,9 +263,7 @@ def render_depth_cuda(
         gaussian_covariances,
         repeat(fake_color, "b g -> b g c ()", c=3),
         gaussian_opacities,
-        gaussian_rotations,
-        gaussian_scales,
         scale_invariant=scale_invariant,
         use_sh=False,
     )
-    return color.mean(dim=1)
+    return result.mean(dim=1)
