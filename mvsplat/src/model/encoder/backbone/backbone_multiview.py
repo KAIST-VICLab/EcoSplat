@@ -1,4 +1,7 @@
+import copy
+
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from .unimatch.backbone import CNNEncoder
@@ -78,6 +81,14 @@ class BackboneMultiview(torch.nn.Module):
                 num_layers=num_layers,
             )
 
+        # IB feature distillation (opt-in). When enabled, `ib_distill_ref` is a
+        # frozen stage-1 copy of `zipmatch`; the forward pass anchors the live
+        # compressed output to the reference (preserving the ZPressor bottleneck
+        # representation during IGF fine-tuning). `ib_distill_loss` is the per-step
+        # MSE side-channel read by the ModelWrapper. Both inert unless enabled.
+        self.ib_distill_ref = None
+        self.ib_distill_loss = None
+
         self.transformer = MultiViewFeatureTransformer(
             num_layers=num_transformer_layers,
             d_model=feature_channels,
@@ -117,6 +128,34 @@ class BackboneMultiview(torch.nn.Module):
 
         return features_list
 
+    def enable_ib_distill(self):
+        """Snapshot the current `zipmatch` as a frozen reference for IB feature
+        distillation. Call AFTER stage-1 weights are loaded so the reference IS
+        the converged stage-1 bottleneck. No-op if clustering is disabled.
+
+        The reference is NOT meant to be saved/restored — it is recreated from
+        stage-1 by the host whenever distillation is enabled; it is excluded from
+        this module's state_dict (see `state_dict` override below) so training
+        checkpoints stay the same size as a normal run.
+        """
+        if not self.use_cluster:
+            return
+        self.ib_distill_ref = copy.deepcopy(self.zipmatch)
+        self.ib_distill_ref.eval()
+        for p in self.ib_distill_ref.parameters():
+            p.requires_grad_(False)
+
+    def state_dict(self, *args, **kwargs):
+        # Keep the frozen distillation reference out of checkpoints — it is a
+        # transient copy of stage-1 `zipmatch`, re-created via enable_ib_distill().
+        # PyTorch's recursive state_dict calls this child with a `prefix=` kwarg, so
+        # ref keys appear as "<prefix>ib_distill_ref.*"; the substring match below
+        # is prefix-agnostic and also covers the no-prefix (direct) call.
+        sd = super().state_dict(*args, **kwargs)
+        for k in [k for k in sd if "ib_distill_ref." in k]:
+            del sd[k]
+        return sd
+
     def forward(
         self,
         images,
@@ -135,12 +174,28 @@ class BackboneMultiview(torch.nn.Module):
         cnn_features = torch.stack(cur_features_list, dim=1)
 
         if self.use_cluster:
+            zipmatch_input = cnn_features  # pre-compression (B, V, C, H, W)
             cnn_features, center_views = self.zipmatch(
-                cnn_features,
+                zipmatch_input,
                 extrinsics=epipolar_kwargs["extrinsics"],
                 cls_token=None,
                 cluster_num=cluster_num,
             )
+            # IB feature distillation: anchor the live compressed output to the
+            # frozen stage-1 zipmatch on the SAME input. Anchor selection (FPS on
+            # camera positions) is parameter-free, so the reference output is
+            # shape-aligned with the live one. Training-only; stashed for the host.
+            if self.training and self.ib_distill_ref is not None:
+                with torch.no_grad():
+                    cnn_ref, _ = self.ib_distill_ref(
+                        zipmatch_input,
+                        extrinsics=epipolar_kwargs["extrinsics"],
+                        cls_token=None,
+                        cluster_num=cluster_num,
+                    )
+                self.ib_distill_loss = F.mse_loss(cnn_features, cnn_ref)
+            else:
+                self.ib_distill_loss = None
             images = center_filter(images, center_views)
             # cur_feature->cur_features_list
             cur_features_list = torch.unbind(cnn_features, dim=1)

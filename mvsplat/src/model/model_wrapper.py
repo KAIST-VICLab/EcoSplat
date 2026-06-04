@@ -187,6 +187,16 @@ class ModelWrapper(LightningModule):
             self.log("info/protect_rate", float(last_igf["protect_rate"]))
             total_loss = total_loss + igf_loss
 
+        # IB feature distillation: anchor the ZPressor (zipmatch) compressed output
+        # to a frozen stage-1 copy, preserving the bottleneck during IGF fine-tuning.
+        # The backbone stashes the per-step MSE; weight comes from the encoder cfg.
+        ib_w = getattr(self.encoder.cfg, "ib_distill_weight", 0.0)
+        ib_raw = getattr(getattr(self.encoder, "backbone", None), "ib_distill_loss", None)
+        if ib_w > 0 and ib_raw is not None:
+            ib_loss = ib_w * ib_raw
+            self.log("loss/ib_distill", ib_loss)
+            total_loss = total_loss + ib_loss
+
         self.log("loss/total", total_loss)
 
         if (

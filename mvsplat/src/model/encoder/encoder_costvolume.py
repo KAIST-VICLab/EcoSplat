@@ -68,6 +68,10 @@ class EncoderCostVolumeCfg:
     igf: Optional[dict] = None  # EcoSplat IGF stage-2 finetune cfg; None disables.
     stage1_weights_path: Optional[str] = None  # stage-1 ckpt loaded into encoder before IGF init.
     freeze_pretrained: bool = False  # True = stage2 SPFSplat style (freeze all except IGF).
+    ib_distill_weight: float = 0.0  # >0 enables IB feature distillation: anchor the
+    # ZPressor (zipmatch) compressed output to a frozen stage-1 copy. Soft alternative
+    # to freeze_pretrained — preserves the bottleneck representation while letting the
+    # rest of the backbone (esp. depth_predictor) adapt to the IGF objective.
 
 class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
     backbone: BackboneMultiview
@@ -197,6 +201,13 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 for p in self.igf_rate_proj.parameters():
                     p.requires_grad = True
                 print("[IGF] freeze_pretrained=True — only IGF + igf_rate_proj train.")
+
+            # IB feature distillation: snapshot the just-loaded (stage-1) zipmatch as
+            # a frozen reference. Soft alternative to freeze_pretrained that keeps the
+            # ZPressor bottleneck intact while the rest of the backbone adapts.
+            if cfg.ib_distill_weight > 0:
+                self.backbone.enable_ib_distill()
+                print(f"[IGF] IB feature distillation ON (weight={cfg.ib_distill_weight}).")
 
     def map_pdf_to_opacity(
         self,
