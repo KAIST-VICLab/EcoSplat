@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from typing import Literal, Optional, List
 
 import torch
@@ -72,6 +72,11 @@ class EncoderCostVolumeCfg:
     # ZPressor (zipmatch) compressed output to a frozen stage-1 copy. Soft alternative
     # to freeze_pretrained — preserves the bottleneck representation while letting the
     # rest of the backbone (esp. depth_predictor) adapt to the IGF objective.
+    igf_frozen_ref_gt: bool = False  # variant (c): clone-and-freeze the FULL stage-1
+    # encoder as a stable reference; the IGF pseudo-GT (importance mask) is generated
+    # from the frozen clone's Gaussians instead of the drifting live model, while the
+    # live model (backbone + merge head) trains with full capacity. Costs one extra
+    # no_grad encoder forward per training step. The clone is excluded from ckpts.
 
 class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
     backbone: BackboneMultiview
@@ -208,6 +213,43 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             if cfg.ib_distill_weight > 0:
                 self.backbone.enable_ib_distill()
                 print(f"[IGF] IB feature distillation ON (weight={cfg.ib_distill_weight}).")
+
+        # Variant (c): clone-and-freeze the FULL stage-1 encoder as a stable pseudo-GT
+        # reference. Built as a plain stage-1 encoder (igf=None → no recursion, no
+        # merge heads) initialized from this encoder's just-loaded stage-1 weights.
+        # Excluded from checkpoints via the state_dict override below; recreated at
+        # init on every run/resume (model_wrapper.on_load_checkpoint re-injects the
+        # keys so strict resume doesn't fail).
+        self.igf_ref = None
+        if cfg.igf is not None and cfg.igf_frozen_ref_gt:
+            ref_cfg = dc_replace(
+                cfg,
+                igf=None,
+                stage1_weights_path=None,
+                unimatch_weights_path=None,
+                freeze_pretrained=False,
+                ib_distill_weight=0.0,
+                igf_frozen_ref_gt=False,
+            )
+            self.igf_ref = EncoderCostVolume(ref_cfg)
+            # Initialize the clone from the live encoder's current (stage-1) weights.
+            # strict=False: the clone has no igf/merge-head params (unexpected keys
+            # in the source dict are ignored).
+            self.igf_ref.load_state_dict(self.state_dict(), strict=False)
+            for p in self.igf_ref.parameters():
+                p.requires_grad_(False)
+            self.igf_ref.eval()
+            print("[IGF] frozen stage-1 reference GT ON — pseudo-GT from igf_ref clone.")
+
+    def state_dict(self, *args, **kwargs):
+        # Keep the frozen stage-1 reference clone out of checkpoints — it is a
+        # deterministic copy of the stage-1 init, re-created in __init__ on every
+        # run. model_wrapper.on_load_checkpoint re-injects the keys on resume so
+        # strict loading doesn't fail.
+        sd = super().state_dict(*args, **kwargs)
+        for k in [k for k in sd if "igf_ref." in k]:
+            del sd[k]
+        return sd
 
     def map_pdf_to_opacity(
         self,
@@ -405,18 +447,34 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # training_step reads `last_igf`. Skip it at inference — `test_step`
             # renders `merged_gaussians_flat` directly and never touches it.
             if self.training:
-                # Stash side-channel for model_wrapper to pick up.
-                ori_flat = Gaussians(
-                    rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-                    rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-                    rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-                    rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-                    rotations=rearrange(gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"),
-                    scales=rearrange(gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-                )
-                v_use = gaussians.means.shape[1]
-                means_pix = gaussians.means.reshape(b, v_use, h, w, 3)
-                cov_pix = gaussians.covariances.reshape(b, v_use, h, w, 3, 3)
+                if self.igf_ref is not None:
+                    # Variant (c): pseudo-GT geometry from the FROZEN stage-1 clone —
+                    # a stable, self-consistent reference — instead of the drifting
+                    # live model. Defensive eval(): Lightning's .train() re-enables
+                    # train mode on all children each epoch.
+                    self.igf_ref.eval()
+                    with torch.no_grad():
+                        ref_flat = self.igf_ref(
+                            context, global_step, deterministic,
+                            scene_names=scene_names,
+                        )
+                    ori_flat = ref_flat
+                    v_use = images.shape[1]
+                    means_pix = ref_flat.means.reshape(b, v_use, h, w, 3)
+                    cov_pix = ref_flat.covariances.reshape(b, v_use, h, w, 3, 3)
+                else:
+                    # Stash side-channel for model_wrapper to pick up.
+                    ori_flat = Gaussians(
+                        rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+                        rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+                        rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+                        rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+                        rotations=rearrange(gaussians.rotations, "b v r srf spp xyzw -> b (v r srf spp) xyzw"),
+                        scales=rearrange(gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+                    )
+                    v_use = gaussians.means.shape[1]
+                    means_pix = gaussians.means.reshape(b, v_use, h, w, 3)
+                    cov_pix = gaussians.covariances.reshape(b, v_use, h, w, 3, 3)
                 distill_infos = self.igf.compute_distill(
                     ori_gaussians={"means_pix": means_pix, "cov_pix": cov_pix},
                     image=images,

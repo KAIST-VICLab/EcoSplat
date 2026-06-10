@@ -679,6 +679,28 @@ class ModelWrapper(LightningModule):
                     str(dir / f"{self.global_step:0>6}.mp4"), logger=None
                 )
 
+    def on_load_checkpoint(self, checkpoint):
+        # Frozen reference modules (encoder.igf_ref.*, backbone ib_distill_ref.*)
+        # are excluded from saved checkpoints — they are deterministic stage-1
+        # copies re-created in __init__. Inject the freshly-built values here so
+        # Lightning's strict load doesn't fail on "missing keys" when resuming a
+        # run that has them enabled.
+        sd = checkpoint.get("state_dict")
+        if sd is None:
+            return
+        injected = 0
+        for name, param in self.named_parameters():
+            if ("igf_ref." in name or "ib_distill_ref." in name) and name not in sd:
+                sd[name] = param.detach().cpu()
+                injected += 1
+        for name, buf in self.named_buffers():
+            if ("igf_ref." in name or "ib_distill_ref." in name) and name not in sd:
+                sd[name] = buf.detach().cpu()
+                injected += 1
+        if injected:
+            print(f"[resume] injected {injected} frozen-reference tensors into the "
+                  f"checkpoint state_dict (refs are rebuilt from stage-1 at init).")
+
     def configure_optimizers(self):
         # Split params: IGF (merge head + rate_embed + igf_rate_proj) gets lr*mult; rest gets lr.
         base_lr = self.optimizer_cfg.lr
